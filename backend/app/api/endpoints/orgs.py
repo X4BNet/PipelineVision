@@ -11,7 +11,11 @@ from app.db.models.runner import Runner
 from app.schemas.user import User
 from app.schemas.org import Runners
 from app.api.dependencies import get_current_user
-from app.services.runner_service import RunnerService, is_self_hosted_runner
+from app.services.runner_service import (
+    RunnerService,
+    is_self_hosted_runner,
+    normalize_runner_name,
+)
 
 router = APIRouter()
 
@@ -49,11 +53,32 @@ def _runners_for_installations(db: Session, installation_ids: list[int]) -> list
 
 
 def _self_hosted_runners(runners: list[Runner]) -> list[Runner]:
-    return [
-        runner
-        for runner in runners
-        if is_self_hosted_runner(runner.name, runner.labels)
-    ]
+    unique_runners = {}
+
+    for runner in runners:
+        if not is_self_hosted_runner(runner.name, runner.labels):
+            continue
+
+        runner_key = normalize_runner_name(runner.name) or f"id:{runner.id}"
+        existing_runner = unique_runners.get(runner_key)
+        if not existing_runner or _runner_recency_key(runner) > _runner_recency_key(
+            existing_runner
+        ):
+            unique_runners[runner_key] = runner
+
+    return sorted(
+        unique_runners.values(),
+        key=_runner_recency_key,
+        reverse=True,
+    )
+
+
+def _runner_recency_key(runner: Runner):
+    return (
+        runner.last_seen or runner.created_at,
+        runner.last_check or runner.created_at,
+        runner.id,
+    )
 
 
 async def _backfill_runners_from_jobs(db: Session, installation_ids: list[int]):

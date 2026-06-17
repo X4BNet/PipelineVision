@@ -1,4 +1,4 @@
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, computed_field, field_validator
 from typing import Optional, List
 from datetime import datetime
 
@@ -9,12 +9,31 @@ class RunnerInfo(BaseModel):
     runner_id: str
     labels: Optional[List[str]] = None
 
+    @field_validator("labels", mode="before")
+    @classmethod
+    def normalize_labels(cls, labels):
+        if not labels:
+            return []
+
+        normalized_labels = []
+        for label in labels:
+            if isinstance(label, str):
+                normalized_labels.append(label)
+            elif isinstance(label, dict) and label.get("name"):
+                normalized_labels.append(label["name"])
+
+        return normalized_labels
+
+    model_config = {"from_attributes": True}
+
 
 class RepositoryInfo(BaseModel):
     id: int
     name: str
     full_name: str
     owner: str
+
+    model_config = {"from_attributes": True}
 
 
 class JobResponse(BaseModel):

@@ -14,6 +14,7 @@ from app.core.config import settings
 
 from app.db.models.installation import Installation
 from app.db.models.runner import Runner
+from app.db.models.job import Job
 from app.db.models.account import Organization
 from app.services.github_service import GitHubService
 from app.db.session import SessionLocal
@@ -36,6 +37,10 @@ def has_self_hosted_label(labels: Optional[List]) -> bool:
 
 def is_github_hosted_runner_name(name: Optional[str]) -> bool:
     return bool(name and name.strip().lower().startswith("github actions"))
+
+
+def normalize_runner_name(name: Optional[str]) -> Optional[str]:
+    return name.strip().lower() if name else None
 
 
 def is_self_hosted_runner(name: Optional[str], labels: Optional[List]) -> bool:
@@ -76,6 +81,110 @@ class RunnerService:
     def _get_runner_activity_key(self, installation_id: int) -> str:
         """Generate cache key for runner activity tracking."""
         return f"runner_activity:installation:{installation_id}"
+
+    def _find_runner_by_name(
+        self, installation_id: int, runner_name: Optional[str]
+    ) -> Optional[Runner]:
+        normalized_name = normalize_runner_name(runner_name)
+        if not normalized_name:
+            return None
+
+        runners = (
+            self.db.query(Runner)
+            .filter(Runner.installation_id == installation_id)
+            .all()
+        )
+        matching_runners = [
+            runner
+            for runner in runners
+            if normalize_runner_name(runner.name) == normalized_name
+        ]
+        if not matching_runners:
+            return None
+
+        matching_runners = sorted(matching_runners, key=lambda runner: runner.id)
+        canonical_runner = matching_runners[0]
+        for duplicate_runner in matching_runners[1:]:
+            canonical_runner = self._merge_runner_records(
+                canonical_runner, duplicate_runner
+            )
+        return canonical_runner
+
+    def _find_runner_by_identity(
+        self, installation_id: int, runner_id: str, runner_name: Optional[str]
+    ) -> Optional[Runner]:
+        runner_by_name = self._find_runner_by_name(installation_id, runner_name)
+        runner_by_id = (
+            self.db.query(Runner)
+            .filter(
+                and_(
+                    Runner.installation_id == installation_id,
+                    Runner.runner_id == runner_id,
+                )
+            )
+            .first()
+        )
+
+        if runner_by_name and runner_by_id and runner_by_name.id != runner_by_id.id:
+            return self._merge_runner_records(runner_by_name, runner_by_id)
+
+        return runner_by_name or runner_by_id
+
+    def _merge_runner_records(self, canonical: Runner, duplicate: Runner) -> Runner:
+        if canonical.id == duplicate.id:
+            return canonical
+
+        self.db.query(Job).filter(Job.runner_id == duplicate.id).update(
+            {Job.runner_id: canonical.id},
+            synchronize_session=False,
+        )
+
+        if not canonical.os and duplicate.os:
+            canonical.os = duplicate.os
+        if not canonical.architecture and duplicate.architecture:
+            canonical.architecture = duplicate.architecture
+        if not canonical.labels and duplicate.labels:
+            canonical.labels = duplicate.labels
+        if canonical.ephemeral is None and duplicate.ephemeral is not None:
+            canonical.ephemeral = duplicate.ephemeral
+        if duplicate.last_seen and (
+            not canonical.last_seen or duplicate.last_seen > canonical.last_seen
+        ):
+            canonical.last_seen = duplicate.last_seen
+        if duplicate.last_check and (
+            not canonical.last_check or duplicate.last_check > canonical.last_check
+        ):
+            canonical.last_check = duplicate.last_check
+
+        self.db.delete(duplicate)
+        self.db.flush()
+        return canonical
+
+    def _apply_runner_data(self, runner: Runner, runner_data: Dict) -> bool:
+        changes_made = False
+
+        updates = {
+            "runner_id": str(runner_data["id"]),
+            "name": runner_data.get("name"),
+            "status": runner_data.get("status"),
+            "labels": runner_data.get("labels", []),
+            "busy": bool(runner_data.get("busy", False)),
+        }
+        for optional_field in ("os", "architecture", "ephemeral"):
+            if optional_field in runner_data:
+                updates[optional_field] = runner_data[optional_field]
+
+        for field, value in updates.items():
+            if value is not None and getattr(runner, field) != value:
+                setattr(runner, field, value)
+                changes_made = True
+
+        if changes_made or runner_data.get("extracted_from") == "webhook":
+            runner.last_check = datetime.utcnow()
+            if runner.status in ["online", "busy"]:
+                runner.last_seen = datetime.utcnow()
+
+        return changes_made
 
     async def extract_runner_from_job_webhook(
         self, installation_id: int, workflow_job: Dict, action: str
@@ -143,31 +252,12 @@ class RunnerService:
         """Update runner data from webhook information."""
         try:
             runner_id = str(runner_data["id"])
-
-            existing_runner = (
-                self.db.query(Runner)
-                .filter(
-                    and_(
-                        Runner.installation_id == installation_id,
-                        Runner.runner_id == runner_id,
-                    )
-                )
-                .first()
+            existing_runner = self._find_runner_by_identity(
+                installation_id, runner_id, runner_data.get("name")
             )
 
             if existing_runner:
-                existing_runner.name = runner_data.get("name", existing_runner.name)
-                existing_runner.status = runner_data.get(
-                    "status", existing_runner.status
-                )
-                existing_runner.busy = bool(
-                    runner_data.get("busy", existing_runner.busy)
-                )
-                existing_runner.labels = runner_data.get(
-                    "labels", existing_runner.labels
-                )
-                existing_runner.last_seen = datetime.utcnow()
-                existing_runner.last_check = datetime.utcnow()
+                self._apply_runner_data(existing_runner, runner_data)
                 self.db.add(existing_runner)
             else:
                 new_runner = Runner(
@@ -413,80 +503,70 @@ class RunnerService:
             return 0
 
         try:
-            existing_runners = (
-                self.db.query(Runner)
-                .filter(Runner.installation_id == installation_id)
-                .all()
-            )
-
-            existing_runner_map = {r.runner_id: r for r in existing_runners}
             processed_runner_ids = set()
+            processed_runner_names = set()
             updated_count = 0
 
             for runner in runners_data:
+                runner_name = runner.get("name")
+                runner_labels = runner.get("labels", [])
+                if not is_self_hosted_runner(runner_name, runner_labels):
+                    continue
+
                 runner_id = str(runner["id"])
                 processed_runner_ids.add(runner_id)
+                normalized_name = normalize_runner_name(runner_name)
+                if normalized_name:
+                    processed_runner_names.add(normalized_name)
 
-                if runner_id in existing_runner_map:
-                    existing_runner = existing_runner_map[runner_id]
-                    changes_made = False
+                runner_data = {
+                    "id": runner_id,
+                    "name": runner_name,
+                    "os": runner.get("os"),
+                    "status": runner.get("status"),
+                    "busy": bool(runner.get("busy", False)),
+                    "labels": runner_labels,
+                    "ephemeral": bool(runner.get("ephemeral", False)),
+                    "architecture": runner.get("architecture"),
+                }
 
-                    if existing_runner.name != runner["name"]:
-                        existing_runner.name = runner["name"]
-                        changes_made = True
-
-                    if existing_runner.status != runner.get("status"):
-                        existing_runner.status = runner.get("status")
-                        changes_made = True
-
-                    if existing_runner.os != runner.get("os"):
-                        existing_runner.os = runner.get("os")
-                        changes_made = True
-
-                    if existing_runner.architecture != runner.get("architecture"):
-                        existing_runner.architecture = runner.get("architecture")
-                        changes_made = True
-
-                    if existing_runner.labels != runner.get("labels", []):
-                        existing_runner.labels = runner.get("labels", [])
-                        changes_made = True
-
-                    new_ephemeral_value = bool(runner.get("ephemeral", False))
-                    if existing_runner.ephemeral != new_ephemeral_value:
-                        existing_runner.ephemeral = new_ephemeral_value
-                        changes_made = True
-
-                    new_busy_value = bool(runner.get("busy", False))
-                    if existing_runner.busy != new_busy_value:
-                        existing_runner.busy = new_busy_value
-                        changes_made = True
-
-                    if changes_made:
-                        existing_runner.last_check = datetime.utcnow()
-                        if existing_runner.status in ["online", "busy"]:
-                            existing_runner.last_seen = datetime.utcnow()
-                        self.db.add(existing_runner)
+                existing_runner = self._find_runner_by_identity(
+                    installation_id, runner_id, runner_name
+                )
+                if existing_runner:
+                    if self._apply_runner_data(existing_runner, runner_data):
                         updated_count += 1
-
+                    self.db.add(existing_runner)
                 else:
                     new_runner = Runner(
                         installation_id=installation_id,
                         runner_id=runner_id,
-                        name=runner["name"],
-                        os=runner.get("os"),
-                        status=runner.get("status"),
-                        busy=bool(runner.get("busy", False)),
-                        labels=runner.get("labels", []),
-                        ephemeral=bool(runner.get("ephemeral", False)),
-                        architecture=runner.get("architecture"),
+                        name=runner_name,
+                        os=runner_data["os"],
+                        status=runner_data["status"],
+                        busy=runner_data["busy"],
+                        labels=runner_data["labels"],
+                        ephemeral=runner_data["ephemeral"],
+                        architecture=runner_data["architecture"],
                         last_seen=datetime.utcnow(),
                         last_check=datetime.utcnow(),
                     )
                     self.db.add(new_runner)
                     updated_count += 1
+                self.db.flush()
 
-            for runner_id, runner in existing_runner_map.items():
-                if runner_id not in processed_runner_ids and runner.status != "offline":
+            existing_runners = (
+                self.db.query(Runner)
+                .filter(Runner.installation_id == installation_id)
+                .all()
+            )
+            for runner in existing_runners:
+                runner_name = normalize_runner_name(runner.name)
+                if (
+                    runner.runner_id not in processed_runner_ids
+                    and runner_name not in processed_runner_names
+                    and runner.status != "offline"
+                ):
                     runner.status = "offline"
                     runner.busy = False
                     runner.last_check = datetime.utcnow()
