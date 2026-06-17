@@ -1,4 +1,5 @@
 import logging
+import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -9,13 +10,17 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 
-DATABASE_URL = (
-    f"postgresql://{Settings.POSTGRES_USER}:{Settings.POSTGRES_PASSWORD}"
-    f"@{Settings.POSTGRES_HOST}:{Settings.POSTGRES_PORT}/{Settings.POSTGRES_DB}"
-    f"?sslmode=require&channel_binding=require"
-)
+def _default_database_url() -> str:
+    return (
+        f"postgresql://{Settings.POSTGRES_USER}:{Settings.POSTGRES_PASSWORD}"
+        f"@{Settings.POSTGRES_HOST}:{Settings.POSTGRES_PORT}/{Settings.POSTGRES_DB}"
+        f"?sslmode=require&channel_binding=require"
+    )
 
-engine = create_engine(DATABASE_URL)
+
+DATABASE_URL = os.getenv("DATABASE_URL") or _default_database_url()
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

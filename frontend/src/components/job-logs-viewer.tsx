@@ -211,7 +211,6 @@ export function JobLogsViewer({
   const [searchTerm, setSearchTerm] = useState("");
   const [showTimestamp, setShowTimestamp] = useState(true);
   const [showLineNumbers, setShowLineNumbers] = useState(true);
-  const [autoScroll, setAutoScroll] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [openSteps, setOpenSteps] = useState<Set<number | null>>(
     new Set([null, 1, 2, 3]),
