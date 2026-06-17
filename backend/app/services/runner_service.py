@@ -22,6 +22,30 @@ from app.db.session import SessionLocal
 logger = logging.getLogger(__name__)
 
 
+def _label_name(label) -> Optional[str]:
+    if isinstance(label, str):
+        return label
+    if isinstance(label, dict):
+        return label.get("name")
+    return None
+
+
+def has_self_hosted_label(labels: Optional[List]) -> bool:
+    return any(_label_name(label) == "self-hosted" for label in labels or [])
+
+
+def is_github_hosted_runner_name(name: Optional[str]) -> bool:
+    return bool(name and name.strip().lower().startswith("github actions"))
+
+
+def is_self_hosted_runner(name: Optional[str], labels: Optional[List]) -> bool:
+    if has_self_hosted_label(labels):
+        return True
+    if is_github_hosted_runner_name(name):
+        return False
+    return bool(name)
+
+
 class RunnerService:
     """
     Efficient Runner Service that reduces GitHub API calls and improves scalability.
@@ -68,6 +92,12 @@ class RunnerService:
             if not runner_name:
                 logger.debug(
                     f"No runner info in job webhook: {workflow_job.get('name')}"
+                )
+                return None
+
+            if not is_self_hosted_runner(runner_name, labels):
+                logger.debug(
+                    f"Skipping GitHub-hosted runner {runner_name} from job webhook"
                 )
                 return None
 

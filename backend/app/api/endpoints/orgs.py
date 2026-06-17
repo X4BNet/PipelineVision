@@ -11,7 +11,7 @@ from app.db.models.runner import Runner
 from app.schemas.user import User
 from app.schemas.org import Runners
 from app.api.dependencies import get_current_user
-from app.services.runner_service import RunnerService
+from app.services.runner_service import RunnerService, is_self_hosted_runner
 
 router = APIRouter()
 
@@ -46,6 +46,14 @@ def _runners_for_installations(db: Session, installation_ids: list[int]) -> list
         .filter(Runner.installation_id.in_(installation_ids))
         .all()
     )
+
+
+def _self_hosted_runners(runners: list[Runner]) -> list[Runner]:
+    return [
+        runner
+        for runner in runners
+        if is_self_hosted_runner(runner.name, runner.labels)
+    ]
 
 
 async def _backfill_runners_from_jobs(db: Session, installation_ids: list[int]):
@@ -127,11 +135,13 @@ async def get_organization_runners(
 
     await _backfill_runners_from_jobs(db, installation_ids)
 
-    runners = _runners_for_installations(db, installation_ids)
+    runners = _self_hosted_runners(_runners_for_installations(db, installation_ids))
     active_installation_ids = _active_installation_ids(db)
     if not runners and set(active_installation_ids) != set(installation_ids):
         await _backfill_runners_from_jobs(db, active_installation_ids)
-        runners = _runners_for_installations(db, active_installation_ids)
+        runners = _self_hosted_runners(
+            _runners_for_installations(db, active_installation_ids)
+        )
 
     total_runners = len(runners)
 
