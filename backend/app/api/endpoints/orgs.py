@@ -2,7 +2,6 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 
 from app.db.session import get_db
@@ -15,6 +14,18 @@ from app.api.dependencies import get_current_user
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
+
+
+def _label_name(label) -> str | None:
+    if isinstance(label, str):
+        return label
+    if isinstance(label, dict):
+        return label.get("name")
+    return None
+
+
+def _has_self_hosted_label(runner: Runner) -> bool:
+    return any(_label_name(label) == "self-hosted" for label in runner.labels or [])
 
 
 # TODO: Rework this. Need to figure out how to collect better stats about the runner
@@ -56,25 +67,22 @@ async def get_organization_runners(
         logger.warning(f"No installation found for {user}")
         raise HTTPException(status_code=404, detail="No installation found")
 
-    # TODO: Not a good long term solution if this label does not exist.
-    base_query = db.query(Runner).filter(
-        Runner.installation_id == installation.installation_id,
-        text(
-            "EXISTS (SELECT 1 FROM json_array_elements(labels) AS elem WHERE elem->>'name' = 'self-hosted')"
-        ),
+    runners = (
+        db.query(Runner)
+        .filter(Runner.installation_id == installation.installation_id)
+        .all()
     )
+    self_hosted_runners = [runner for runner in runners if _has_self_hosted_label(runner)]
 
-    total_runners = base_query.count()
+    total_runners = len(self_hosted_runners)
 
-    online_count = base_query.filter(Runner.status == "online").count()
+    online_count = sum(1 for runner in self_hosted_runners if runner.status == "online")
 
-    offline_count = base_query.filter(Runner.status == "offline").count()
+    offline_count = sum(1 for runner in self_hosted_runners if runner.status == "offline")
 
-    busy_count = base_query.filter(Runner.busy).count()
+    busy_count = sum(1 for runner in self_hosted_runners if runner.busy)
 
-    runners = base_query.all()
-
-    runners_list = [Runners.from_orm(r) for r in runners]
+    runners_list = [Runners.from_orm(r) for r in self_hosted_runners]
 
     return {
         "total_runners": total_runners,

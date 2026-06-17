@@ -172,7 +172,7 @@ async def github_webhook(
         )
 
         await workflow_service.process_workflow_job_event(
-            installation["id"], workflow_job, repository
+            installation["id"], workflow_job, repository, payload.get("action")
         )
 
         try:

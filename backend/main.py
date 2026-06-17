@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.middleware.logging import StructuredLoggingMiddleware
 from app.middleware.auth import BetterAuthMiddleware
 from app.services.github_installation_sync import sync_github_app_installations
+from app.services.runner_service import smart_runner_scheduler
 
 load_dotenv()
 
@@ -42,7 +43,15 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    yield
+    try:
+        await smart_runner_scheduler.start()
+    except Exception as exc:
+        logger.warning("Smart runner scheduler startup failed: %s", exc)
+
+    try:
+        yield
+    finally:
+        await smart_runner_scheduler.stop()
 
 
 app = FastAPI(

@@ -406,6 +406,23 @@ class RunnerService:
                         existing_runner.status = runner.get("status")
                         changes_made = True
 
+                    if existing_runner.os != runner.get("os"):
+                        existing_runner.os = runner.get("os")
+                        changes_made = True
+
+                    if existing_runner.architecture != runner.get("architecture"):
+                        existing_runner.architecture = runner.get("architecture")
+                        changes_made = True
+
+                    if existing_runner.labels != runner.get("labels", []):
+                        existing_runner.labels = runner.get("labels", [])
+                        changes_made = True
+
+                    new_ephemeral_value = bool(runner.get("ephemeral", False))
+                    if existing_runner.ephemeral != new_ephemeral_value:
+                        existing_runner.ephemeral = new_ephemeral_value
+                        changes_made = True
+
                     new_busy_value = bool(runner.get("busy", False))
                     if existing_runner.busy != new_busy_value:
                         existing_runner.busy = new_busy_value

@@ -16,7 +16,9 @@ from datetime import datetime
 
 from app.db.models.job import Workflow, WorkflowRun, Job, JobStep, JobLog
 from app.db.models.repository import Repository
+from app.db.models.runner import Runner
 from app.services.github_service import GitHubService
+from app.services.runner_service import RunnerService
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,11 @@ class WorkflowService:
             raise
 
     async def process_workflow_job_event(
-        self, installation_id: int, workflow_job: Dict, repository_data: Dict
+        self,
+        installation_id: int,
+        workflow_job: Dict,
+        repository_data: Dict,
+        action: Optional[str] = None,
     ):
         """Process a GitHub workflow_job webhook event"""
         try:
@@ -82,6 +88,9 @@ class WorkflowService:
 
             job = await self._create_or_update_job(
                 workflow_job, repo.id, installation_id
+            )
+            await self._create_or_update_runner_from_job(
+                installation_id, workflow_job, job, action
             )
 
             if workflow_job.get("steps"):
@@ -340,6 +349,40 @@ class WorkflowService:
         self.db.refresh(job)
 
         return job
+
+    async def _create_or_update_runner_from_job(
+        self,
+        installation_id: int,
+        workflow_job: Dict,
+        job: Job,
+        action: Optional[str] = None,
+    ):
+        """Create or update the runner referenced by a workflow_job webhook."""
+        runner_id = workflow_job.get("runner_id")
+        runner_name = workflow_job.get("runner_name")
+        if not runner_id or not runner_name:
+            return
+
+        runner_service = RunnerService(self.db)
+        await runner_service.extract_runner_from_job_webhook(
+            installation_id=installation_id,
+            workflow_job=workflow_job,
+            action=action or workflow_job.get("status") or "updated",
+        )
+
+        runner = (
+            self.db.query(Runner)
+            .filter(
+                Runner.installation_id == installation_id,
+                Runner.runner_id == str(runner_id),
+            )
+            .first()
+        )
+        if runner and job.runner_id != runner.id:
+            job.runner_id = runner.id
+            self.db.add(job)
+            self.db.commit()
+            self.db.refresh(job)
 
     async def _create_or_update_job_steps(self, steps_data: List[Dict], job_id: int):
         """Create or update job steps"""
