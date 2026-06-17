@@ -46,7 +46,7 @@ export function useRunners() {
       }
       return response.json();
     },
-    enabled: isAuthenticated && !!preference?.organization_id,
+    enabled: isAuthenticated,
     refetchInterval: 30 * 1000, // 30 seconds
     staleTime: 15 * 1000, // 15 seconds
     retry: (failureCount, error) => {

@@ -6,26 +6,88 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.db.models.installation import Installation
+from app.db.models.job import Job
 from app.db.models.runner import Runner
 from app.schemas.user import User
 from app.schemas.org import Runners
 from app.api.dependencies import get_current_user
+from app.services.runner_service import RunnerService
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
 
-def _label_name(label) -> str | None:
-    if isinstance(label, str):
-        return label
-    if isinstance(label, dict):
-        return label.get("name")
-    return None
+def _installation_ids_for_user(user: User, db: Session) -> list[int]:
+    if user.get("organization_id"):
+        installations = (
+            db.query(Installation)
+            .filter(Installation.organization_id == user["organization_id"])
+            .all()
+        )
+        if installations:
+            return [installation.installation_id for installation in installations]
+
+    installations = db.query(Installation).filter(Installation.active).all()
+    return [installation.installation_id for installation in installations]
 
 
-def _has_self_hosted_label(runner: Runner) -> bool:
-    return any(_label_name(label) == "self-hosted" for label in runner.labels or [])
+def _active_installation_ids(db: Session) -> list[int]:
+    installations = db.query(Installation).filter(Installation.active).all()
+    return [installation.installation_id for installation in installations]
+
+
+def _runners_for_installations(db: Session, installation_ids: list[int]) -> list[Runner]:
+    if not installation_ids:
+        return []
+
+    return (
+        db.query(Runner)
+        .filter(Runner.installation_id.in_(installation_ids))
+        .all()
+    )
+
+
+async def _backfill_runners_from_jobs(db: Session, installation_ids: list[int]):
+    if not installation_ids:
+        return
+
+    jobs = (
+        db.query(Job)
+        .filter(Job.installation_id.in_(installation_ids))
+        .filter(Job.raw_data.isnot(None))
+        .order_by(Job.updated_at.desc())
+        .limit(500)
+        .all()
+    )
+    runner_service = RunnerService(db)
+
+    for job in jobs:
+        workflow_job = job.raw_data or {}
+        if not workflow_job.get("runner_name"):
+            continue
+
+        runner_data = await runner_service.extract_runner_from_job_webhook(
+            installation_id=job.installation_id,
+            workflow_job=workflow_job,
+            action=workflow_job.get("status") or "updated",
+        )
+        if not runner_data:
+            continue
+
+        runner = (
+            db.query(Runner)
+            .filter(
+                Runner.installation_id == job.installation_id,
+                Runner.runner_id == str(runner_data["id"]),
+            )
+            .first()
+        )
+        if runner and job.runner_id != runner.id:
+            job.runner_id = runner.id
+            db.add(job)
+
+    db.commit()
 
 
 # TODO: Rework this. Need to figure out how to collect better stats about the runner
@@ -57,32 +119,29 @@ async def get_organization_runners(
     Raises:
         HTTPException: If no installation is found for the user's organization (404).
     """
-    installation: Installation = (
-        db.query(Installation)
-        .filter(Installation.organization_id == user["organization_id"])
-        .first()
-    )
+    installation_ids = _installation_ids_for_user(user, db)
 
-    if not installation:
+    if not installation_ids:
         logger.warning(f"No installation found for {user}")
         raise HTTPException(status_code=404, detail="No installation found")
 
-    runners = (
-        db.query(Runner)
-        .filter(Runner.installation_id == installation.installation_id)
-        .all()
-    )
-    self_hosted_runners = [runner for runner in runners if _has_self_hosted_label(runner)]
+    await _backfill_runners_from_jobs(db, installation_ids)
 
-    total_runners = len(self_hosted_runners)
+    runners = _runners_for_installations(db, installation_ids)
+    active_installation_ids = _active_installation_ids(db)
+    if not runners and set(active_installation_ids) != set(installation_ids):
+        await _backfill_runners_from_jobs(db, active_installation_ids)
+        runners = _runners_for_installations(db, active_installation_ids)
 
-    online_count = sum(1 for runner in self_hosted_runners if runner.status == "online")
+    total_runners = len(runners)
 
-    offline_count = sum(1 for runner in self_hosted_runners if runner.status == "offline")
+    online_count = sum(1 for runner in runners if runner.status == "online")
 
-    busy_count = sum(1 for runner in self_hosted_runners if runner.busy)
+    offline_count = sum(1 for runner in runners if runner.status == "offline")
 
-    runners_list = [Runners.from_orm(r) for r in self_hosted_runners]
+    busy_count = sum(1 for runner in runners if runner.busy)
+
+    runners_list = [Runners.from_orm(r) for r in runners]
 
     return {
         "total_runners": total_runners,

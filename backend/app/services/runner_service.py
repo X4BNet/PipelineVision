@@ -65,11 +65,14 @@ class RunnerService:
             runner_id = workflow_job.get("runner_id")
             labels = workflow_job.get("labels", [])
 
-            if not runner_name or not runner_id:
+            if not runner_name:
                 logger.debug(
                     f"No runner info in job webhook: {workflow_job.get('name')}"
                 )
                 return None
+
+            if not runner_id:
+                runner_id = f"name:{runner_name}"
 
             runner_status = "online"
             runner_busy = False

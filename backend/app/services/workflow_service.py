@@ -358,23 +358,24 @@ class WorkflowService:
         action: Optional[str] = None,
     ):
         """Create or update the runner referenced by a workflow_job webhook."""
-        runner_id = workflow_job.get("runner_id")
         runner_name = workflow_job.get("runner_name")
-        if not runner_id or not runner_name:
+        if not runner_name:
             return
 
         runner_service = RunnerService(self.db)
-        await runner_service.extract_runner_from_job_webhook(
+        runner_data = await runner_service.extract_runner_from_job_webhook(
             installation_id=installation_id,
             workflow_job=workflow_job,
             action=action or workflow_job.get("status") or "updated",
         )
+        if not runner_data:
+            return
 
         runner = (
             self.db.query(Runner)
             .filter(
                 Runner.installation_id == installation_id,
-                Runner.runner_id == str(runner_id),
+                Runner.runner_id == str(runner_data["id"]),
             )
             .first()
         )
